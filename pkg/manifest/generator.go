@@ -108,6 +108,7 @@ func (g *Generator) Generate(rootPath string) (*Manifest, error) {
 				}
 				defer file.Close()
 
+				g.chunker.GenerateChunks(path)
 				for _, chunk := range chunks {
 					chunkIDs = append(chunkIDs, chunk.ChunksIds...)
 				}
