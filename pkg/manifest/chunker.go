@@ -1,11 +1,16 @@
 package manifest
 
 import (
+	"bufio"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -26,9 +31,11 @@ func NewChunker(chunkSize int64, startChunkID int64) *Chunker {
 }
 
 func (c *Chunker) Calculate(path string) ([]*Chunk, int64, error) {
+	fmt.Printf("\nCalculating chunks for: %s\n", path)
+
 	stats, err := os.Stat(path)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("failed to stat file: %w", err)
 	}
 	fileSize := stats.Size()
 	if fileSize == 0 {
@@ -58,71 +65,159 @@ func (c *Chunker) Calculate(path string) ([]*Chunk, int64, error) {
 }
 
 func (c *Chunker) GenerateChunks(path string) ([]*Chunk, int64, error) {
+	fmt.Printf("\nGenerating chunks for: %s\n", path)
+
 	chunks, fileSize, err := c.Calculate(path)
 	if err != nil {
 		return nil, 0, err
 	}
+
 	chunksDir := "chunks"
 	if err := os.MkdirAll(chunksDir, 0755); err != nil {
 		return nil, 0, fmt.Errorf("failed to create chunks directory: %w", err)
 	}
+
 	if len(chunks) == 0 {
 		return chunks, 0, nil
 	}
+
 	sourceFile, err := os.Open(path)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to open source file: %w", err)
 	}
 	defer sourceFile.Close()
 
-	for i, _ := range chunks[0].ChunksIds {
-		offset := int64(i) * c.chunkSize
-		size := c.chunkSize
-		if offset+size > fileSize {
-			size = fileSize - offset
-		}
+	numWorkers := runtime.NumCPU()
+	var wg sync.WaitGroup
+	errChan := make(chan error, numWorkers)
+	semaphore := make(chan struct{}, numWorkers)
 
-		uuid := generateUUID()
-		chunkPath := filepath.Join(chunksDir, fmt.Sprintf("%s.chunk", uuid))
+	for i, chunkID := range chunks[0].ChunksIds {
+		wg.Add(1)
 
-		chunkFile, err := os.Create(chunkPath)
-		if err != nil {
-			return nil, 0, fmt.Errorf("failed to create chunk file %s: %w", chunkPath, err)
-		}
+		go func(idx int, id int) {
+			defer wg.Done()
 
-		if _, err := sourceFile.Seek(offset, 0); err != nil {
-			chunkFile.Close()
-			return nil, 0, fmt.Errorf("failed to seek in source file: %w", err)
-		}
-
-		buffer := make([]byte, fileBufferSize)
-		bytesRemaining := size
-		for bytesRemaining > 0 {
-			bufferSize := int64(fileBufferSize)
-			if bytesRemaining < bufferSize {
-				bufferSize = bytesRemaining
-			}
-			n, err := sourceFile.Read(buffer[:bufferSize])
-			if err != nil && err != io.EOF {
-				chunkFile.Close()
-				return nil, 0, fmt.Errorf("failed to read from source file: %w", err)
-			}
-			if n > 0 {
-				if _, err := chunkFile.Write(buffer[:n]); err != nil {
-					chunkFile.Close()
-					return nil, 0, fmt.Errorf("failed to write to chunk file: %w", err)
+			semaphore <- struct{}{}
+			defer func() {
+				select {
+				case <-semaphore:
+				default:
+					fmt.Println("[ERROR] Semaphore release failed, worker stuck!")
 				}
-				bytesRemaining -= int64(n)
-			}
-			if err == io.EOF {
-				break
-			}
-		}
+			}()
 
-		if err := chunkFile.Close(); err != nil {
-			return nil, 0, fmt.Errorf("failed to close chunk file: %w", err)
-		}
+			fmt.Printf("Processing chunk %d of %s\n", id, path)
+
+			offset := int64(idx) * c.chunkSize
+			size := c.chunkSize
+			if offset+size > fileSize {
+				size = fileSize - offset
+			}
+
+			sf, err := os.Open(path)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to open source file for chunk %d: %w", id, err)
+				return
+			}
+			defer sf.Close()
+
+			if _, err := sf.Seek(offset, 0); err != nil {
+				errChan <- fmt.Errorf("failed to seek in source file for chunk %d: %w", id, err)
+				return
+			}
+
+			chunkPath := filepath.Join(chunksDir, fmt.Sprintf("%d.chunk", id))
+			chunkFile, err := os.Create(chunkPath)
+			if err != nil {
+				errChan <- fmt.Errorf("failed to create chunk file %s: %w", chunkPath, err)
+				return
+			}
+
+			bufferedWriter := bufio.NewWriterSize(chunkFile, fileBufferSize)
+			gzipWriter, err := gzip.NewWriterLevel(bufferedWriter, gzip.BestSpeed)
+			if err != nil {
+				chunkFile.Close()
+				errChan <- fmt.Errorf("failed to create gzip writer: %w", err)
+				return
+			}
+
+			if _, err := io.CopyN(gzipWriter, sf, size); err != nil {
+				gzipWriter.Close()
+				bufferedWriter.Flush()
+				chunkFile.Close()
+				errChan <- fmt.Errorf("failed to copy data for chunk %d: %w", id, err)
+				return
+			}
+
+			if err := gzipWriter.Close(); err != nil {
+				bufferedWriter.Flush()
+				chunkFile.Close()
+				errChan <- fmt.Errorf("failed to close gzip writer for chunk %d: %w", id, err)
+				return
+			}
+
+			if err := bufferedWriter.Flush(); err != nil {
+				chunkFile.Close()
+				errChan <- fmt.Errorf("failed to flush buffer for chunk %d: %w", id, err)
+				return
+			}
+
+			if err := chunkFile.Close(); err != nil {
+				errChan <- fmt.Errorf("failed to close chunk file for chunk %d: %w", id, err)
+				return
+			}
+		}(i, chunkID)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		fmt.Println("[ERROR]", err)
 	}
 
 	return chunks, fileSize, nil
+}
+
+func ProcessFiles(fileQueue chan string, totalFiles atomic.Int64, processedFiles atomic.Int64, g *Chunker, rootPath string, startTime time.Time) {
+	var wg sync.WaitGroup
+	errChan := make(chan error, 1000)
+
+	for i := 0; i < runtime.NumCPU(); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range fileQueue {
+				fmt.Printf("\nProcessing file: %s\n", path)
+
+				_, _, err := g.Calculate(path)
+				if err != nil {
+					errChan <- fmt.Errorf("Error calculating chunks for %s: %w", path, err)
+					continue
+				}
+
+				_, _, err = g.GenerateChunks(path)
+				if err != nil {
+					errChan <- fmt.Errorf("Error generating chunks for %s: %w", path, err)
+					continue
+				}
+
+				curr := processedFiles.Add(1)
+				if curr%100 == 0 {
+					fmt.Printf("\r• Processed %d files (%.1f%%) [%d/s]\n",
+						curr,
+						float64(curr)/float64(totalFiles.Load())*100,
+						int(float64(curr)/time.Since(startTime).Seconds()))
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	for err := range errChan {
+		fmt.Println("[ERROR]", err)
+	}
 }

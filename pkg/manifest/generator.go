@@ -91,8 +91,6 @@ func (g *Generator) Generate(rootPath string) (*Manifest, error) {
 		go func() {
 			defer wg.Done()
 			for path := range fileQueue {
-				fmt.Printf("%s Processing: %s\n", cyan("→"), path)
-
 				chunks, size, err := g.chunker.Calculate(path)
 				if err != nil {
 					errChan <- &GenerationError{Path: path, Err: err}
@@ -112,12 +110,6 @@ func (g *Generator) Generate(rootPath string) (*Manifest, error) {
 				for _, chunk := range chunks {
 					chunkIDs = append(chunkIDs, chunk.ChunksIds...)
 				}
-
-				fmt.Printf("%s File: %s - Size: %s - Chunks: %d\n",
-					cyan("✓"),
-					path,
-					humanize.Bytes(uint64(size)),
-					len(chunkIDs))
 
 				relPath, _ := filepath.Rel(rootPath, path)
 				results <- FileResult{
