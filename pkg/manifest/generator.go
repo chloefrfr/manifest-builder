@@ -66,7 +66,7 @@ func (g *Generator) Generate(rootPath string) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("chunk size calculation failed: %w", err)
 	}
-	g.chunker = NewChunker(chunkSize, 1)
+	g.chunker = NewChunker(chunkSize)
 
 	workerCount := runtime.NumCPU() * 2
 	fileQueue := make(chan string, workerCount*10)

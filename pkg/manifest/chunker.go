@@ -24,10 +24,14 @@ type Chunker struct {
 	nextChunk atomic.Int64
 }
 
-func NewChunker(chunkSize int64, startChunkID int64) *Chunker {
+func NewChunker(chunkSize int64) *Chunker {
 	c := &Chunker{chunkSize: chunkSize}
-	c.nextChunk.Store(startChunkID)
+	c.nextChunk.Store(1) 
 	return c
+}
+
+func (c *Chunker) ResetChunkCounter() {
+	c.nextChunk.Store(1)
 }
 
 func (c *Chunker) Calculate(path string) ([]*Chunk, int64, error) {
@@ -41,6 +45,8 @@ func (c *Chunker) Calculate(path string) ([]*Chunk, int64, error) {
 	if fileSize == 0 {
 		return []*Chunk{}, 0, nil
 	}
+
+	c.ResetChunkCounter()
 
 	numChunks := (fileSize + c.chunkSize - 1) / c.chunkSize
 	chunks := make([]*Chunk, 0, numChunks)
@@ -66,6 +72,8 @@ func (c *Chunker) Calculate(path string) ([]*Chunk, int64, error) {
 
 func (c *Chunker) GenerateChunks(path string) ([]*Chunk, int64, error) {
 	fmt.Printf("\nGenerating chunks for: %s\n", path)
+
+	c.ResetChunkCounter()
 
 	chunks, fileSize, err := c.Calculate(path)
 	if err != nil {
@@ -100,11 +108,7 @@ func (c *Chunker) GenerateChunks(path string) ([]*Chunk, int64, error) {
 
 			semaphore <- struct{}{}
 			defer func() {
-				select {
-				case <-semaphore:
-				default:
-					fmt.Println("[ERROR] Semaphore release failed, worker stuck!")
-				}
+				<-semaphore
 			}()
 
 			fmt.Printf("Processing chunk %d of %s\n", id, path)
@@ -133,48 +137,45 @@ func (c *Chunker) GenerateChunks(path string) ([]*Chunk, int64, error) {
 				errChan <- fmt.Errorf("failed to create chunk file %s: %w", chunkPath, err)
 				return
 			}
+			defer chunkFile.Close()
 
 			bufferedWriter := bufio.NewWriterSize(chunkFile, fileBufferSize)
 			gzipWriter, err := gzip.NewWriterLevel(bufferedWriter, gzip.BestSpeed)
 			if err != nil {
-				chunkFile.Close()
 				errChan <- fmt.Errorf("failed to create gzip writer: %w", err)
 				return
 			}
 
 			if _, err := io.CopyN(gzipWriter, sf, size); err != nil {
 				gzipWriter.Close()
-				bufferedWriter.Flush()
-				chunkFile.Close()
 				errChan <- fmt.Errorf("failed to copy data for chunk %d: %w", id, err)
 				return
 			}
 
 			if err := gzipWriter.Close(); err != nil {
-				bufferedWriter.Flush()
-				chunkFile.Close()
 				errChan <- fmt.Errorf("failed to close gzip writer for chunk %d: %w", id, err)
 				return
 			}
 
 			if err := bufferedWriter.Flush(); err != nil {
-				chunkFile.Close()
 				errChan <- fmt.Errorf("failed to flush buffer for chunk %d: %w", id, err)
 				return
 			}
 
-			if err := chunkFile.Close(); err != nil {
-				errChan <- fmt.Errorf("failed to close chunk file for chunk %d: %w", id, err)
-				return
-			}
 		}(i, chunkID)
 	}
 
 	wg.Wait()
 	close(errChan)
 
+	var errorFound bool
 	for err := range errChan {
+		errorFound = true
 		fmt.Println("[ERROR]", err)
+	}
+
+	if errorFound {
+		return nil, 0, fmt.Errorf("errors occurred during chunk generation")
 	}
 
 	return chunks, fileSize, nil
@@ -191,11 +192,14 @@ func ProcessFiles(fileQueue chan string, totalFiles atomic.Int64, processedFiles
 			for path := range fileQueue {
 				fmt.Printf("\nProcessing file: %s\n", path)
 
+				g.ResetChunkCounter()
+
 				_, _, err := g.Calculate(path)
 				if err != nil {
 					errChan <- fmt.Errorf("Error calculating chunks for %s: %w", path, err)
 					continue
 				}
+				g.ResetChunkCounter()
 
 				_, _, err = g.GenerateChunks(path)
 				if err != nil {
